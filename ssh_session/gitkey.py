@@ -113,10 +113,10 @@ def _askpass_script(state_dir: Path) -> Path:
 def load(key: Path, hours: int, store: SecretStore, state_dir: Path) -> None:
     """Add the key to the agent for HOURS, supplying its passphrase from STORE."""
     if not key.exists():
-        raise GitKeyError(f"no git key at {key}; run gitkey enroll")
+        raise GitKeyError(f"no git key at {key}; run ssh-session gitkey enroll")
     pw = store.get(account_for(key))
     if pw is None:
-        raise GitKeyError(f"no passphrase for {key} in the Keychain; run gitkey enroll on this machine")
+        raise GitKeyError(f"no passphrase for {key} in the Keychain; run ssh-session gitkey enroll on this machine")
     env = dict(os.environ)
     env.update({
         "SSH_ASKPASS": str(_askpass_script(state_dir)),

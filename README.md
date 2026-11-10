@@ -6,6 +6,7 @@ the git key, loaded into the ssh-agent.
     ssh-session                  today's session certificate and the git key, into the agent
     ssh-session --role root      a root session (YubiKey)
     ssh-session status           what the agent holds, and until when
+    ssh-session gitkey load      the git key alone into the agent (no YubiKey)
     ssh-session gitkey enroll    make this machine's git key, once
     ssh-session --host H         a certificate for another machine's own key (YubiKey)
 
@@ -35,7 +36,8 @@ loaded for the same hours.
 A passphrase-protected key file for git hosting. Its passphrase is 256 random
 bits nobody types, kept in the macOS login Keychain; outside the agent's
 window the file is inert. `ssh-session gitkey enroll` makes it and prints the
-public key to add to the git hosts.
+public key to add to the git hosts. `ssh-session gitkey load` loads it on its
+own; `ssh-add` on the file cannot work, because nobody knows the passphrase.
 
 ## Use from another flake
 

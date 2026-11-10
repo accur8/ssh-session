@@ -4,6 +4,7 @@
     ssh-session                  today's session certificate and the git key, into the agent
     ssh-session --role root      a root session (YubiKey)
     ssh-session status           what the agent holds, and until when
+    ssh-session gitkey load      the git key alone into the agent (no YubiKey)
     ssh-session gitkey enroll    make this machine's git key, once
     ssh-session --host H         a certificate for another machine's own key (YubiKey)
 
@@ -118,3 +119,17 @@ def enroll(comment):
         sys.exit(1)
     click.echo(f"git key made at {gk.DEFAULT_KEY}; add this public key to gitea and github:")
     click.echo(pub.read_text().strip())
+
+
+@gitkey.command(context_settings=HELP)
+@click.option("--hours", type=int, default=4, show_default=True)
+def load(hours):
+    """Load the git key alone into the agent for HOURS: its passphrase comes
+    from the Keychain, so there is no PIN and no touch. Every ssh-session run
+    does this already; this is for when only the git key has lapsed."""
+    try:
+        gk.load(gk.DEFAULT_KEY, hours, gk.KeychainStore(), STATE_DIR)
+    except gk.GitKeyError as e:
+        click.echo(f"ssh-session: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"git key loaded for {hours}h")

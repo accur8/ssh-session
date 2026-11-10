@@ -142,6 +142,12 @@ def test_the_command_without_a_yubikey_gets_an_account_ca_session(service, agent
     assert st.exit_code == 0 and "tester-dev" in st.output and "git key: not loaded" in st.output
 
 
-def test_gitkey_enroll_is_a_subcommand():
+def test_gitkey_enroll_and_load_are_subcommands():
     r = CliRunner().invoke(cli.main, ["gitkey", "--help"])
-    assert r.exit_code == 0 and "enroll" in r.output
+    assert r.exit_code == 0 and "enroll" in r.output and "load" in r.output
+
+
+def test_gitkey_load_without_a_key_says_so(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.gk, "DEFAULT_KEY", tmp_path / "no-git-key")
+    r = CliRunner().invoke(cli.main, ["gitkey", "load"])
+    assert r.exit_code == 1 and "ssh-session gitkey enroll" in r.output
