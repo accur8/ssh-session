@@ -41,6 +41,18 @@ def yubikey_ca(ca: Path | None) -> Path | None:
     return s.choose_ca(handles, serials)
 
 
+def signer_line() -> str:
+    """Who would sign a session started now."""
+    handles, serials = s.ca_handles(), s.plugged_serials()
+    enrolled = [n for n in serials if n in handles]
+    if enrolled:
+        return f"signer:  the admin CA on YubiKey {', '.join(enrolled)}"
+    if serials:
+        return (f"signer:  the account CA service ({accountca.SERVICE}); YubiKey {', '.join(serials)} "
+                f"is plugged in but is not an enrolled admin CA")
+    return f"signer:  the account CA service ({accountca.SERVICE}); no YubiKey is plugged in"
+
+
 def load_git_key(hours: int, no_git: bool) -> None:
     if no_git or not gk.DEFAULT_KEY.exists():
         return
@@ -91,7 +103,8 @@ def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git):
 @main.command(context_settings=HELP)
 def status():
     """What the agent holds: each session certificate with its principals and
-    time left, and whether the git key is loaded."""
+    time left, whether the git key is loaded, and who would sign a session
+    started now."""
     try:
         for line in s.status_lines(s.agent_certificates()):
             click.echo(line)
@@ -99,6 +112,7 @@ def status():
         click.echo(f"ssh-session: {e}", err=True)
         sys.exit(1)
     click.echo(f"git key: {'loaded' if gk.loaded(gk.DEFAULT_KEY) else 'not loaded'}")
+    click.echo(signer_line())
 
 
 @main.group(context_settings=HELP)

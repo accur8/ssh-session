@@ -122,6 +122,15 @@ def test_two_enrolled_yubikeys_is_an_error(monkeypatch, tmp_path):
         cli.yubikey_ca(None)
 
 
+def test_status_says_who_would_sign(monkeypatch, tmp_path):
+    plugged(monkeypatch, {"111": tmp_path / "a"}, ["111"])
+    assert "admin CA on YubiKey 111" in cli.signer_line()
+    plugged(monkeypatch, {"111": tmp_path / "a"}, ["999"])
+    assert "account CA service" in cli.signer_line() and "999" in cli.signer_line()
+    plugged(monkeypatch, {}, [])
+    assert "no YubiKey is plugged in" in cli.signer_line()
+
+
 def test_role_without_a_yubikey_is_refused(monkeypatch):
     plugged(monkeypatch, {}, [])
     r = CliRunner().invoke(cli.main, ["--role", "root"])
