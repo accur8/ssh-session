@@ -58,6 +58,12 @@ rm -rf "$d"
     return tmp_path
 
 
+def make_key_of(path: Path, kind: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ssh-keygen", "-q", "-t", kind, "-N", "", "-f", str(path)], check=True)
+    return path
+
+
 def make_key(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path)], check=True)
@@ -84,6 +90,25 @@ def test_a_refusal_from_the_service_is_reported_and_loads_nothing(service, agent
         accountca.mint(key, hours=3)
     assert s.agent_certificates() == []
     assert not (key.parent / "id_ed25519-cert.pub").exists()
+
+
+def test_the_developer_key_is_the_first_that_ssh_would_try(tmp_path):
+    d = tmp_path / ".ssh"
+    assert accountca.default_key(d) == d / "id_ed25519"  # none yet: the name a refusal gives
+    make_key_of(d / "id_rsa", "rsa")
+    assert accountca.default_key(d) == d / "id_rsa"
+    make_key_of(d / "id_ed25519", "ed25519")
+    assert accountca.default_key(d) == d / "id_ed25519"
+    (d / "id_ed25519.pub").unlink()  # half a key is not a key
+    assert accountca.default_key(d) == d / "id_rsa"
+
+
+@needs_openssh
+def test_an_rsa_key_is_certified_like_any_other(service, agent, tmp_path):
+    key = make_key_of(tmp_path / "home" / ".ssh" / "id_rsa", "rsa")
+    cert = accountca.mint(key, hours=2)
+    assert cert.principals == ("tester-dev",)
+    assert [c.principals for c in s.agent_certificates()] == [("tester-dev",)]
 
 
 def test_no_yubikey_and_no_key_says_both_ways_forward(tmp_path):
@@ -141,8 +166,7 @@ def test_role_without_a_yubikey_is_refused(monkeypatch):
 def test_the_command_without_a_yubikey_gets_an_account_ca_session(service, agent, tmp_path, monkeypatch):
     plugged(monkeypatch, {}, [])
     key = make_key(tmp_path / "home" / ".ssh" / "id_ed25519")
-    monkeypatch.setattr(accountca, "DEFAULT_KEY", key)
-    monkeypatch.setattr(accountca.mint, "__defaults__", (key,))
+    monkeypatch.setattr(accountca, "default_key", lambda ssh_dir=None: key)
     monkeypatch.setattr(cli.gk, "DEFAULT_KEY", tmp_path / "no-git-key")
     r = CliRunner().invoke(cli.main, [])
     assert r.exit_code == 0, r.output

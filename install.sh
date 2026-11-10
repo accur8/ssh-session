@@ -13,7 +13,7 @@
 # It never touches a key, the agent's contents, or anything it did not link.
 set -euo pipefail
 
-TAG=${1:-v1.0.2}
+TAG=${1:-v1.0.3}
 TOOL="$HOME/.local/state/ssh-session/tool"
 BIN="$HOME/bin"
 say() { printf '%s\n' "$*"; }
@@ -49,7 +49,8 @@ if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
 else
   say "  ssh-agent  none in this shell: start one (eval \"\$(ssh-agent -s)\") before ssh-session"
 fi
-[ -f "$HOME/.ssh/id_ed25519" ] && say "  key        ~/.ssh/id_ed25519 is here" || say "  key        no ~/.ssh/id_ed25519"
+key=""; for k in id_ed25519 id_ecdsa id_rsa; do [ -f "$HOME/.ssh/$k" ] && [ -f "$HOME/.ssh/$k.pub" ] && { key=$k; break; }; done
+[ -n "$key" ] && say "  key        ~/.ssh/$key (certified by the account CA when no YubiKey signs)" || say "  key        none of ~/.ssh/id_ed25519, id_ecdsa, id_rsa"
 if [ -f "$HOME/.ssh/id_ed25519_git" ]; then
   say "  git key    ~/.ssh/id_ed25519_git is here"
 elif [ "$(uname -s)" = Darwin ]; then

@@ -10,8 +10,9 @@
 
 Who signs is decided by what is present. An enrolled YubiKey plugged in signs a
 fresh key pair with the admin CA on it (PIN and touch); the private half is on
-disk only until ssh-add. Otherwise the account CA service certifies
-~/.ssh/id_ed25519. Either way the git key is loaded for the same hours.
+disk only until ssh-add. Otherwise the account CA service certifies your own
+key (~/.ssh/id_ed25519, id_ecdsa or id_rsa, the first that exists). Either way
+the git key is loaded for the same hours.
 """
 from __future__ import annotations
 

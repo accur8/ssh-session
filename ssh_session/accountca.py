@@ -1,8 +1,8 @@
 """A session certificate from the account CA service: the signer ssh-session
 uses when no enrolled YubiKey is plugged in.
 
-A developer has one ssh key, ~/.ssh/id_ed25519, enrolled once by an admin on
-the service (sign@ca.intra: a line there names the principals that key may be
+A developer has one ssh key (the first of ~/.ssh/id_ed25519, id_ecdsa,
+id_rsa that exists), enrolled once by an admin on the service (sign@ca.intra: a line there names the principals that key may be
 issued). The service certifies that key for some hours; the certificate is
 written beside the key (<key>-cert.pub, where ssh finds it) and key and
 certificate go into the ssh-agent until the certificate expires.
@@ -16,9 +16,21 @@ from pathlib import Path
 from .session import Certificate, SessionError, keygen_listing
 
 SERVICE = "sign@ca.intra"
-DEFAULT_KEY = Path.home() / ".ssh" / "id_ed25519"
+# The developer's key: the first of these that exists, the order ssh itself tries.
+KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa")
 DEFAULT_HOURS = 12
 MAX_HOURS = 24
+
+
+def default_key(ssh_dir: Path | None = None) -> Path:
+    """The developer's key: the first of KEY_NAMES with both halves in
+    ~/.ssh, else ~/.ssh/id_ed25519 (which a refusal then names)."""
+    ssh_dir = ssh_dir or Path.home() / ".ssh"
+    for name in KEY_NAMES:
+        key = ssh_dir / name
+        if key.exists() and key.with_name(name + ".pub").exists():
+            return key
+    return ssh_dir / KEY_NAMES[0]
 
 
 def certificate_line(output: str) -> str:
@@ -29,16 +41,18 @@ def certificate_line(output: str) -> str:
     return ""
 
 
-def mint(key: Path = DEFAULT_KEY, *, hours: int = DEFAULT_HOURS, service: str = SERVICE) -> Certificate:
-    """Have SERVICE certify KEY for HOURS, write the certificate beside the key
-    and load both into the agent until the certificate expires."""
+def mint(key: Path | None = None, *, hours: int = DEFAULT_HOURS, service: str = SERVICE) -> Certificate:
+    """Have SERVICE certify KEY (default: default_key()) for HOURS, write the
+    certificate beside the key and load both into the agent until it expires."""
+    key = key or default_key()
     if not 1 <= hours <= MAX_HOURS:
         raise SessionError(f"--hours must be 1-{MAX_HOURS} for a certificate from {service}")
     pub = key.with_name(key.name + ".pub")
     if not pub.exists() or not key.exists():
         raise SessionError(
-            f"no enrolled YubiKey is plugged in, and there is no key at {key} for {service} to certify: "
-            f"plug in your YubiKey, or make a key with `ssh-keygen -t ed25519` and have an admin enrol it on {service}")
+            f"no enrolled YubiKey is plugged in, and there is no key ({', '.join(KEY_NAMES)}) in {key.parent} "
+            f"for {service} to certify: plug in your YubiKey, or make a key with `ssh-keygen -t ed25519` "
+            f"and have an admin enrol it on {service}")
     # The key being certified is the one that authenticates: its line on the
     # service names the principals. A refusal ("no principals on this line;
     # ask an admin") comes back on stderr.

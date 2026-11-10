@@ -8,7 +8,7 @@
 }:
 python3.pkgs.buildPythonApplication {
   pname = "ssh-session";
-  version = "1.0.2";
+  version = "1.0.3";
   pyproject = true;
   src = lib.fileset.toSource {
     root = ./.;
