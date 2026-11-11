@@ -151,9 +151,20 @@ def test_status_says_who_would_sign(monkeypatch, tmp_path):
     plugged(monkeypatch, {"111": tmp_path / "a"}, ["111"])
     assert "admin CA on YubiKey 111" in cli.signer_line()
     plugged(monkeypatch, {"111": tmp_path / "a"}, ["999"])
-    assert "account CA service" in cli.signer_line() and "999" in cli.signer_line()
+    assert "account CA service" in cli.signer_line() and "no admin CA handle" in cli.signer_line()
+    assert "yubikey-999" in cli.signer_line()
     plugged(monkeypatch, {}, [])
     assert "no YubiKey is plugged in" in cli.signer_line()
+
+
+def test_a_failed_account_ca_names_the_yubikey_without_a_handle(monkeypatch, tmp_path):
+    plugged(monkeypatch, {}, ["27539133"])
+    def refused(**kw):
+        raise s.SessionError("sign@ca.intra did not issue a certificate: could not resolve ca.intra")
+    monkeypatch.setattr(accountca, "mint", refused)
+    r = CliRunner().invoke(cli.main, [])
+    assert r.exit_code == 1
+    assert "could not resolve ca.intra" in r.output and "no admin CA handle" in r.output and "yubikey-27539133" in r.output
 
 
 def test_role_without_a_yubikey_is_refused(monkeypatch):

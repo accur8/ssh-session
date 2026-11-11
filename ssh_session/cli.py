@@ -42,6 +42,15 @@ def yubikey_ca(ca: Path | None) -> Path | None:
     return s.choose_ca(handles, serials)
 
 
+def no_handle(serials: list[str]) -> str:
+    """Why a plugged-in YubiKey does not sign here: this machine has no admin
+    CA handle naming it. The handle is the file the enrolment wrote; a second
+    machine needs its own copy, or ssh-keygen -K from the YubiKey."""
+    return (f"YubiKey {', '.join(serials)} is plugged in, but this machine has no admin CA handle for it "
+            f"(~/.ssh/id_ed25519_sk_accur8*.pub whose comment names yubikey-{serials[0]}); copy the handle "
+            f"files from a machine that has them, or this is not an admin YubiKey")
+
+
 def signer_line() -> str:
     """Who would sign a session started now."""
     handles, serials = s.ca_handles(), s.plugged_serials()
@@ -49,8 +58,7 @@ def signer_line() -> str:
     if enrolled:
         return f"signer:  the admin CA on YubiKey {', '.join(enrolled)}"
     if serials:
-        return (f"signer:  the account CA service ({accountca.SERVICE}); YubiKey {', '.join(serials)} "
-                f"is plugged in but is not an enrolled admin CA")
+        return (f"signer:  the account CA service ({accountca.SERVICE}); {no_handle(serials)}")
     return f"signer:  the account CA service ({accountca.SERVICE}); no YubiKey is plugged in"
 
 
@@ -83,7 +91,11 @@ def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git):
             if roles or strict or host:
                 raise s.SessionError("--role, --strict and --host need the admin CA on a YubiKey, and no enrolled one is plugged in")
             h = hours or accountca.DEFAULT_HOURS
-            accountca.mint(hours=h)
+            try:
+                accountca.mint(hours=h)
+            except s.SessionError as e:
+                serials = s.plugged_serials()
+                raise s.SessionError(f"{e}\n  {no_handle(serials)}" if serials else str(e)) from e
             load_git_key(h, no_git)
             return
         roles = list(roles) or ["dev"]

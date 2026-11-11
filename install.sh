@@ -13,7 +13,7 @@
 # It never touches a key, the agent's contents, or anything it did not link.
 set -euo pipefail
 
-TAG=${1:-v1.0.3}
+TAG=${1:-v1.0.4}
 TOOL="$HOME/.local/state/ssh-session/tool"
 BIN="$HOME/bin"
 say() { printf '%s\n' "$*"; }
