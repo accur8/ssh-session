@@ -171,6 +171,13 @@ def test_role_without_a_yubikey_is_refused(monkeypatch):
     plugged(monkeypatch, {}, [])
     r = CliRunner().invoke(cli.main, ["--role", "root"])
     assert r.exit_code == 1 and "need the admin CA on a YubiKey" in r.output
+    assert "no YubiKey is plugged in" in r.output
+
+
+def test_role_with_a_yubikey_but_no_handle_names_the_handle(monkeypatch):
+    plugged(monkeypatch, {}, ["27539133"])
+    r = CliRunner().invoke(cli.main, ["--role", "root"])
+    assert r.exit_code == 1 and "no admin CA handle" in r.output and "yubikey-27539133" in r.output
 
 
 @needs_openssh

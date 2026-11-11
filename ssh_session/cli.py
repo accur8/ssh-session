@@ -89,7 +89,9 @@ def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git):
         ca = yubikey_ca(ca)
         if ca is None:
             if roles or strict or host:
-                raise s.SessionError("--role, --strict and --host need the admin CA on a YubiKey, and no enrolled one is plugged in")
+                serials = s.plugged_serials()
+                why = no_handle(serials) if serials else "no YubiKey is plugged in"
+                raise s.SessionError(f"--role, --strict and --host need the admin CA on a YubiKey: {why}")
             h = hours or accountca.DEFAULT_HOURS
             try:
                 accountca.mint(hours=h)
