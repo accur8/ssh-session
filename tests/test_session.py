@@ -188,3 +188,11 @@ def test_covered_roles_follow_nesting():
     assert s.covered_roles("root") == ["prod", "dev"]
     assert s.covered_roles("prod") == ["dev"]
     assert s.covered_roles("dev") == []
+
+
+def test_a_locked_keychain_says_how_to_unlock(monkeypatch):
+    locked = subprocess.CompletedProcess([], 51, "", "security: SecKeychainItemCreateFromContent (<default>): User interaction is not allowed.\n")
+    monkeypatch.setattr(gk.KeychainStore, "_security", staticmethod(lambda args: locked))
+    for call in (lambda: gk.KeychainStore().set("a", "b"), lambda: gk.KeychainStore().get("a")):
+        with pytest.raises(gk.GitKeyError, match="security unlock-keychain"):
+            call()

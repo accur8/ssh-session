@@ -34,18 +34,31 @@ class SecretStore(Protocol):
     def set(self, account: str, secret: str) -> None: ...
 
 
+# macOS keeps the login Keychain locked to an ssh session; security(1) then
+# says "User interaction is not allowed".
+LOCKED_HINT = ("\n  over ssh the login Keychain is locked: run "
+               "`security unlock-keychain ~/Library/Keychains/login.keychain-db` (it asks for this Mac's "
+               "login password), then run this again; or run it in a Terminal on the Mac itself")
+
+
+def locked(r: subprocess.CompletedProcess) -> bool:
+    return "User interaction is not allowed" in (r.stderr or "")
+
+
 class KeychainStore:
     """The macOS login Keychain, through the security(1) tool."""
 
     def get(self, account: str) -> str | None:
         r = self._security(["find-generic-password", "-s", SERVICE, "-a", account, "-w"])
+        if r.returncode != 0 and locked(r):
+            raise GitKeyError(f"the Keychain is locked to this session.{LOCKED_HINT}")
         return r.stdout.strip() if r.returncode == 0 else None
 
     def set(self, account: str, secret: str) -> None:
         r = self._security(["add-generic-password", "-U", "-s", SERVICE, "-a", account,
                             "-l", "accur8 git key passphrase", "-w", secret])
         if r.returncode != 0:
-            raise GitKeyError(f"the Keychain refused the passphrase: {r.stderr.strip()}")
+            raise GitKeyError(f"the Keychain refused the passphrase: {r.stderr.strip()}{LOCKED_HINT if locked(r) else ''}")
 
     @staticmethod
     def _security(args: list[str]) -> subprocess.CompletedProcess:
