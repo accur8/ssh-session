@@ -7,12 +7,16 @@
     ssh-session gitkey load      the git key alone into the agent (no YubiKey)
     ssh-session gitkey enroll    make this machine's git key, once
     ssh-session --host H         a certificate for another machine's own key (YubiKey)
+    ssh-session tools            the managed checkouts: clone, fast-forward, install
 
 Who signs is decided by what is present. An enrolled YubiKey plugged in signs a
 fresh key pair with the admin CA on it (PIN and touch); the private half is on
 disk only until ssh-add. Otherwise the account CA service certifies your own
 key (~/.ssh/id_ed25519, id_ecdsa or id_rsa, the first that exists). Either way
-the git key is loaded for the same hours.
+the git key is loaded for the same hours. With the git key loaded, every run
+then brings the managed checkouts up to date: the internal tools in private
+repositories, each cloned once under ~/code/accur8 and connected by its own
+install script (ssh-session tools).
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ import click
 from . import accountca
 from . import gitkey as gk
 from . import session as s
+from . import tools as t
 
 STATE_DIR = Path.home() / ".local" / "state" / "ssh-session"
 HELP = {"help_option_names": ["-h", "--help"]}
@@ -69,6 +74,13 @@ def load_git_key(hours: int, no_git: bool) -> None:
     click.echo(f"git key loaded for {hours}h")
 
 
+def sync_tools(no_tools: bool) -> None:
+    """The managed checkouts, once git access is there. Reports and never fails the session."""
+    if no_tools or not gk.loaded(gk.DEFAULT_KEY):
+        return
+    t.sync(echo=click.echo)
+
+
 @click.group(invoke_without_command=True, context_settings=HELP, help=__doc__)
 @click.option("--role", "roles", multiple=True, type=click.Choice(list(s.ROLES)),
               help="YubiKey: which role certificate to mint: dev (default), prod, root. Repeatable; root is never implied.")
@@ -81,8 +93,9 @@ def load_git_key(hours: int, no_git: bool) -> None:
 @click.option("--user", "remote_user", default=os.environ.get("USER", "unknown"), show_default="you", help="Account on --host.")
 @click.option("--key", default=".ssh/id_accur8", show_default=True, help="Key path on --host, relative to the account's home.")
 @click.option("--no-git", is_flag=True, help="Do not load the git key into the agent alongside the session.")
+@click.option("--no-tools", is_flag=True, help="Do not bring the managed checkouts up to date after loading the git key.")
 @click.pass_context
-def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git):
+def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git, no_tools):
     if ctx.invoked_subcommand is not None:
         return
     try:
@@ -99,6 +112,7 @@ def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git):
                 serials = s.plugged_serials()
                 raise s.SessionError(f"{e}\n  {no_handle(serials)}" if serials else str(e)) from e
             load_git_key(h, no_git)
+            sync_tools(no_tools)
             return
         roles = list(roles) or ["dev"]
         user = os.environ.get("USER", "unknown")
@@ -110,6 +124,7 @@ def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git):
         h = hours or 4
         s.mint_local(roles, hours=h, strict=strict, ca=ca, user=user, state_dir=STATE_DIR)
         load_git_key(h, no_git)
+        sync_tools(no_tools)
     except (s.SessionError, gk.GitKeyError) as e:
         click.echo(f"ssh-session: {e}", err=True)
         sys.exit(1)
@@ -162,3 +177,17 @@ def load(hours):
         click.echo(f"ssh-session: {e}", err=True)
         sys.exit(1)
     click.echo(f"git key loaded for {hours}h")
+
+
+@main.command(context_settings=HELP)
+def tools():
+    """The managed checkouts: each internal tool in a private repository is cloned
+    once under ~/code/accur8 (SSH_SESSION_CODE_ROOT), fast-forwarded when it is
+    clean and on its default branch (left alone otherwise), and connected by its
+    own install script. Every ssh-session run that loads the git key does this;
+    this is the same pass on its own. Needs git access (the git key loaded)."""
+    if not gk.loaded(gk.DEFAULT_KEY):
+        click.echo("ssh-session: the git key is not in the agent: run ssh-session (or ssh-session gitkey load) first", err=True)
+        sys.exit(1)
+    if not t.sync(echo=click.echo):
+        sys.exit(1)

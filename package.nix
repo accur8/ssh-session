@@ -5,10 +5,11 @@
   python3,
   openssh,
   yubikey-manager,
+  git,
 }:
 python3.pkgs.buildPythonApplication {
   pname = "ssh-session";
-  version = "1.0.6";
+  version = "1.0.7";
   pyproject = true;
   src = lib.fileset.toSource {
     root = ./.;
@@ -23,6 +24,7 @@ python3.pkgs.buildPythonApplication {
   nativeCheckInputs = [
     python3.pkgs.pytestCheckHook
     openssh
+    git
   ];
   # nixpkgs' openssh ahead of the system's: the one with FIDO support, which
   # signing with a CA key on a YubiKey needs. ykman lists what is plugged in.
@@ -34,6 +36,12 @@ python3.pkgs.buildPythonApplication {
       openssh
       yubikey-manager
     ])
+    # git for the managed checkouts (ssh-session tools), after the user's own: their git and its
+    # config win wherever there is one
+    "--suffix"
+    "PATH"
+    ":"
+    (lib.makeBinPath [ git ])
   ];
   meta.mainProgram = "ssh-session";
 }

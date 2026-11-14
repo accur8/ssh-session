@@ -9,6 +9,7 @@ the git key, loaded into the ssh-agent.
     ssh-session gitkey load      the git key alone into the agent (no YubiKey)
     ssh-session gitkey enroll    make this machine's git key, once
     ssh-session --host H         a certificate for another machine's own key (YubiKey)
+    ssh-session tools            the managed checkouts: clone, fast-forward, install
 
 ## Getting started
 
@@ -102,6 +103,21 @@ bits nobody types, kept in the macOS login Keychain; outside the agent's
 window the file is inert. `ssh-session gitkey enroll` makes it and prints the
 public key to add to the git hosts. `ssh-session gitkey load` loads it on its
 own; `ssh-add` on the file cannot work, because nobody knows the passphrase.
+
+## Managed checkouts
+
+ssh-session brings git access; the internal tools come after it. Each is a private repository
+checked out once under `~/code/accur8` (or `SSH_SESSION_CODE_ROOT`), and that checkout is the tool's
+single source of truth: its own `install` script links what it provides (a Claude Code skill, a
+command on PATH) into the checkout. Every run that loads the git key then, for each tool in
+`ssh_session/tools.py`:
+
+- clones a missing checkout;
+- fetches and fast-forwards one that is clean and on its default branch; one with local changes,
+  commits of its own or on another branch is left exactly as it is, with a warning;
+- runs the tool's `install` (idempotent).
+
+None of this fails the session. `--no-tools` skips it; `ssh-session tools` runs the pass on its own.
 
 ## Use from another flake
 
