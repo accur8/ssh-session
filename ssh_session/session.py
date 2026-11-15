@@ -78,6 +78,20 @@ def principals_for(user: str, role: str, strict: bool) -> str:
     return ",".join(f"{user}-{r}" for r in names)
 
 
+def git_principal(user: str) -> str:
+    """The principal that is USER on the git host: gitea lets in a certificate whose principal a gitea
+    user has registered, and the name is the role style, gitea-USER, not the gitea username
+    (TASK-20261029-gitea-trusts-the-admin-ssh-ca)."""
+    return f"gitea-{user}"
+
+
+def certificate_principals(user: str, role: str, strict: bool) -> str:
+    """Everything a session certificate for ROLE carries: the host roles (principals_for), and who
+    USER is on the git host. Strict narrows the host roles; git is not one of them, so it stays:
+    one session opens the hosts and git for the same hours."""
+    return f"{principals_for(user, role, strict)},{git_principal(user)}"
+
+
 @dataclass(frozen=True)
 class Certificate:
     key_id: str
@@ -177,7 +191,7 @@ def mint_local(roles: Iterable[str], *, hours: int, strict: bool, ca: Path, user
     tmp = Path(tempfile.mkdtemp(prefix="mint.", dir=state_dir))
     try:
         for role in roles:
-            principals = principals_for(user, role, strict)
+            principals = certificate_principals(user, role, strict)
             stamp = _stamp()
             key = tmp / role
             _run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"session {_me()} {stamp} {role}", "-f", str(key)])
@@ -203,7 +217,7 @@ def mint_local(roles: Iterable[str], *, hours: int, strict: bool, ca: Path, user
 def mint_remote(host: str, remote_user: str, key: str, role: str, *, hours: int, strict: bool, ca: Path, user: str, state_dir: Path) -> Certificate:
     """Sign HOST's own key pair (made there on first use) and install the
     certificate beside it. The private half never leaves HOST."""
-    principals = principals_for(user, role, strict)
+    principals = certificate_principals(user, role, strict)
     state_dir.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="remote.", dir=state_dir))
     try:
