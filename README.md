@@ -96,16 +96,6 @@ Decided by what is present; there is no flag for it.
 Either way the git key (`~/.ssh/id_ed25519_git`, when this machine has one) is
 loaded for the same hours.
 
-A certificate signed by an admin CA also carries `gitea-<you>`: git.accur8.net lets in a
-certificate whose principal you have registered on your gitea account (Settings, SSH / GPG
-Keys, Manage SSH Certificate Principals), so the session opens git as well as the hosts and
-the git key is not needed there. Have ssh offer the session to the git host first:
-
-    Host git.accur8.net
-        IdentityFile ~/.ssh/session
-        IdentityFile ~/.ssh/id_ed25519_git
-        IdentitiesOnly yes
-
 ## The git key
 
 A passphrase-protected key file for git hosting. Its passphrase is 256 random

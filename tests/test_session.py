@@ -42,13 +42,6 @@ def test_principals_strict_is_the_one_role():
     assert s.principals_for("ada", "prod", True) == "ada-prod"
 
 
-def test_a_certificate_also_says_who_the_user_is_on_the_git_host():
-    assert s.certificate_principals("ada", "root", False) == "ada-root,ada-prod,ada-dev,gitea-ada"
-    assert s.certificate_principals("ada", "dev", False) == "ada-dev,gitea-ada"
-    # strict narrows the host roles; git is not a host role
-    assert s.certificate_principals("ada", "prod", True) == "ada-prod,gitea-ada"
-
-
 def test_unknown_role_is_an_error():
     with pytest.raises(s.SessionError):
         s.principals_for("ada", "admin", False)
@@ -87,15 +80,15 @@ def test_mint_local_against_a_software_ca(tmp_path, monkeypatch):
         monkeypatch.setenv("USER", "tester")
         try:
             minted = s.mint_local(["prod", "root"], hours=1, strict=False, ca=ca, user="tester", state_dir=tmp_path / "state", ssh_dir=tmp_path / "dotssh")
-            assert [c.principals for c in minted] == [("tester-prod", "tester-dev", "gitea-tester"), ("tester-root", "tester-prod", "tester-dev", "gitea-tester")]
+            assert [c.principals for c in minted] == [("tester-prod", "tester-dev"), ("tester-root", "tester-prod", "tester-dev")]
             strict = s.mint_local(["root"], hours=1, strict=True, ca=ca, user="tester", state_dir=tmp_path / "state", ssh_dir=tmp_path / "dotssh")
             assert (tmp_path / "dotssh" / "session-root.pub").exists() and (tmp_path / "dotssh" / "session-root-cert.pub").exists()
             assert not (tmp_path / "dotssh" / "session-root").exists()  # never a private key
             assert (tmp_path / "dotssh" / "session.pub").exists() and (tmp_path / "dotssh" / "session-cert.pub").exists()
-            assert strict[0].principals == ("tester-root", "gitea-tester")
+            assert strict[0].principals == ("tester-root",)
             held = s.agent_certificates()
             # root covers the prod session minted with it, so prod was retired; the strict one stays
-            assert sorted(c.principals for c in held) == [("tester-root", "gitea-tester"), ("tester-root", "tester-prod", "tester-dev", "gitea-tester")]
+            assert sorted(c.principals for c in held) == [("tester-root",), ("tester-root", "tester-prod", "tester-dev")]
             assert all(len(l) > 0 for l in s.status_lines(held))
             # no key material left behind
             assert list((tmp_path / "state").glob("mint.*")) == []
@@ -180,10 +173,10 @@ def test_a_new_session_retires_the_ones_it_covers(tmp_path, monkeypatch):
             # prod covers dev: one session left, plus the unrelated key
             held = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True).stdout.splitlines()
             assert len(held) == 3, held
-            assert [c.principals for c in s.agent_certificates()] == [("tester-prod", "tester-dev", "gitea-tester")]
+            assert [c.principals for c in s.agent_certificates()] == [("tester-prod", "tester-dev")]
             # a strict dev session does NOT retire the prod one
             s.mint_local(["dev"], hours=1, strict=True, ca=ca, user="tester", state_dir=tmp_path / "st", ssh_dir=tmp_path / "dotssh")
-            assert sorted(c.principals for c in s.agent_certificates()) == [("tester-dev", "gitea-tester"), ("tester-prod", "tester-dev", "gitea-tester")]
+            assert sorted(c.principals for c in s.agent_certificates()) == [("tester-dev",), ("tester-prod", "tester-dev")]
             assert any("ada git" in l for l in subprocess.run(["ssh-add", "-L"], capture_output=True, text=True).stdout.splitlines())
         finally:
             subprocess.run(["kill", pid], check=False)
