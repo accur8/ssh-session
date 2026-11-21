@@ -6,7 +6,7 @@
     ssh-session status           what the agent holds, and until when
     ssh-session gitkey load      the git key alone into the agent (no YubiKey)
     ssh-session gitkey enroll    make this machine's git key, once
-    ssh-session --host H         a certificate for another machine's own key (YubiKey)
+    ssh-session --host H         a session for another machine: into its agent if it opted in, else a certificate file (YubiKey)
     ssh-session tools            the managed checkouts: clone, fast-forward, install
 
 Who signs is decided by what is present. An enrolled YubiKey plugged in signs a
@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 import click
+from click.core import ParameterSource
 
 from . import accountca
 from . import gitkey as gk
@@ -89,9 +90,9 @@ def sync_tools(no_tools: bool) -> None:
 @click.option("--strict", is_flag=True, help="YubiKey: the one role only; by default a certificate also carries the roles below it.")
 @click.option("--ca", type=click.Path(path_type=Path), default=None,
               help="YubiKey: the admin CA handle (default: the one whose YubiKey is plugged in).")
-@click.option("--host", default=None, help="YubiKey: mint for another machine: its own key pair gets the certificate as a file.")
+@click.option("--host", default=None, help="YubiKey: mint for another machine: into its agent if ~/.config/ssh-session/agent-target exists there, else its own key pair gets the certificate as a file.")
 @click.option("--user", "remote_user", default=os.environ.get("USER", "unknown"), show_default="you", help="Account on --host.")
-@click.option("--key", default=".ssh/id_accur8", show_default=True, help="Key path on --host, relative to the account's home.")
+@click.option("--key", default=".ssh/id_accur8", show_default=True, help="Key path on --host, relative to the account's home. Given explicitly, always the certificate-file path.")
 @click.option("--no-git", is_flag=True, help="Do not load the git key into the agent alongside the session.")
 @click.option("--no-tools", is_flag=True, help="Do not bring the managed checkouts up to date after loading the git key.")
 @click.pass_context
@@ -119,6 +120,10 @@ def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git, no_tools
         if host:
             if len(roles) != 1:
                 raise s.SessionError("one --role per remote machine (its certificate is one file)")
+            # an explicit --key asks for that key file, so only the default looks for the marker
+            if ctx.get_parameter_source("key") == ParameterSource.DEFAULT and s.target_takes_agent(host, remote_user):
+                s.mint_remote_agent(host, remote_user, roles[0], hours=hours or 2, strict=strict, ca=ca, user=user, state_dir=STATE_DIR)
+                return
             s.mint_remote(host, remote_user, key, roles[0], hours=hours or 2, strict=strict, ca=ca, user=user, state_dir=STATE_DIR)
             return
         h = hours or 4

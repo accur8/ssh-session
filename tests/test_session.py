@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -182,6 +183,91 @@ def test_a_new_session_retires_the_ones_it_covers(tmp_path, monkeypatch):
             subprocess.run(["kill", pid], check=False)
     finally:
         shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def push_target(tmp_path, monkeypatch):
+    """A target account: a private HOME with a real agent on ~/.ssh/agent.sock,
+    and an `ssh` that runs the remote command there. The system temp directory
+    rather than tmp_path, because a unix socket path is limited to about 100
+    characters; the nix build has no real home to use instead."""
+    home = Path(tempfile.mkdtemp(prefix="t0p"))
+    (home / ".ssh").mkdir(mode=0o700)
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "ssh").write_text(
+        '#!/bin/sh\n'
+        'while [ $# -gt 0 ]; do case "$1" in -T) shift;; -o) shift 2;; *) break;; esac; done\n'
+        'shift\n'
+        'cd "$HOME"\n'
+        'exec bash -c "$*"\n')
+    (fake / "ssh").chmod(0o755)
+    ca = tmp_path / "ca"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ca)], check=True)
+    agent = subprocess.run(["ssh-agent", "-a", str(home / ".ssh/agent.sock")], capture_output=True, text=True, check=True).stdout
+    pid = [l for l in agent.splitlines() if "SSH_AGENT_PID" in l][0].split("=")[1].split(";")[0]
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(home / ".ssh/agent.sock"))
+    monkeypatch.setattr(s, "_me", lambda: "tester@signer")
+    try:
+        yield home, ca, tmp_path / "st", pid
+    finally:
+        subprocess.run(["kill", pid], check=False)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+@needs_openssh
+def test_the_marker_decides_the_destination(push_target):
+    home, *_ = push_target
+    assert s.target_takes_agent("box", "tester") is False
+    (home / ".config/ssh-session").mkdir(parents=True)
+    (home / ".config/ssh-session/agent-target").touch()
+    assert s.target_takes_agent("box", "tester") is True
+
+
+@needs_openssh
+def test_a_push_lands_in_the_targets_agent_and_leaves_no_key(push_target):
+    home, ca, state, _ = push_target
+    s.mint_remote_agent("box", "tester", "dev", hours=1, strict=False, ca=ca, user="tester", state_dir=state)
+    s.mint_remote_agent("box", "tester", "prod", hours=1, strict=False, ca=ca, user="tester", state_dir=state)
+    # prod covers dev: the second push retired the first
+    assert [c.principals for c in s.agent_certificates()] == [("tester-prod", "tester-dev")]
+    assert "via tester@signer" in subprocess.run(["ssh-add", "-L"], capture_output=True, text=True).stdout
+    assert list((home / ".ssh").glob(".session-push.*")) == []
+    assert (home / ".ssh/session-cert.pub").exists() and (home / ".ssh/session-prod-cert.pub").exists()
+    assert not (home / ".ssh/session").exists() and not (home / ".ssh/session-prod").exists()
+    assert list(state.glob("remote.*")) == []
+
+
+@needs_openssh
+def test_a_dead_agent_is_refused_before_signing(push_target, monkeypatch):
+    home, ca, state, pid = push_target
+    subprocess.run(["kill", pid], check=True)
+    for _ in range(50):
+        if subprocess.run(["ssh-add", "-l"], capture_output=True).returncode == 2:
+            break
+        time.sleep(0.05)
+    monkeypatch.setattr(s, "sign", lambda *a, **k: pytest.fail("signed for a dead agent"))
+    with pytest.raises(s.SessionError, match="no ssh-agent answers"):
+        s.mint_remote_agent("box", "tester", "dev", hours=1, strict=False, ca=ca, user="tester", state_dir=state)
+    assert list((home / ".ssh").glob(".session-push.*")) == []
+
+
+@needs_openssh
+def test_a_failed_signing_leaves_no_key_on_the_target(push_target, monkeypatch):
+    home, ca, state, _ = push_target
+    def refuse(*a, **k):
+        raise s.SessionError("PIN refused")
+    monkeypatch.setattr(s, "sign", refuse)
+    with pytest.raises(s.SessionError, match="PIN refused"):
+        s.mint_remote_agent("box", "tester", "dev", hours=1, strict=False, ca=ca, user="tester", state_dir=state)
+    assert list((home / ".ssh").glob(".session-push.*")) == []
+    assert s.agent_certificates() == []
+
+
+def test_the_push_script_survives_a_single_quoted_login_shell():
+    assert "'" not in s.PUSH_SCRIPT and "\\" not in s.PUSH_SCRIPT
 
 
 def test_covered_roles_follow_nesting():

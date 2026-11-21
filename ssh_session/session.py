@@ -7,17 +7,22 @@ role and, unless strict, for every role below it; host authorized_keys lines
 are always strict (one account class, one principal), so nesting is purely the
 client's choice. Root is never implied: dev is the default.
 
-Two destinations:
+Three destinations:
   local   a fresh key pair into the ssh-agent with its certificate, for N hours;
           the private half exists on disk only between generation and ssh-add.
   remote  another machine's own key pair (made there on first use) gets the
           certificate as a file beside the key, over the ssh session you have.
+  remote agent
+          a machine that opted in with the marker file AGENT_MARKER makes a
+          fresh key pair and loads the key and certificate into its own agent;
+          the private half never leaves that machine and no key file remains.
 """
 from __future__ import annotations
 
 import datetime as dt
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -30,6 +35,49 @@ from typing import Iterable, Sequence
 ROLES: tuple[str, ...] = ("dev", "prod", "root")
 BELOW: dict[str, tuple[str, ...]] = {"dev": (), "prod": ("dev",), "root": ("prod", "dev")}
 DEFAULT_CA = Path.home() / ".ssh" / "id_ed25519_sk_accur8"
+# Relative to the target account's home. The file's presence is the target's
+# consent to receive pushed sessions in its agent; its contents are not read.
+AGENT_MARKER = ".config/ssh-session/agent-target"
+# A forwarded agent on the target would receive the session meant for the
+# target's own agent, so a push never forwards anything.
+NO_FORWARDING = ("-T", "-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes",
+                 "-o", "ConnectTimeout=10")
+# Runs on the target under bash, passed through the login shell (often fish) in
+# single quotes, so this text holds no single quote and no backslash. One ssh
+# connection spans the signing: when the connection ends for any reason, the
+# read fails and the trap removes the private half.
+PUSH_SCRIPT = """set -eu
+stamp=$1; hours=$2; role=$3; via=$4
+export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock"
+rc=0; ssh-add -l >/dev/null 2>&1 </dev/null || rc=$?
+if [ "$rc" -ge 2 ]; then echo "no ssh-agent answers on $SSH_AUTH_SOCK" >&2; exit 3; fi
+d=$(mktemp -d "$HOME/.ssh/.session-push.XXXXXX")
+cleanup() { rm -rf "$d"; }
+trap cleanup EXIT
+trap "exit 1" HUP INT TERM PIPE
+me="$(id -un)@$(hostname | cut -d. -f1)"
+ssh-keygen -q -t ed25519 -N "" -C "session $me $stamp $role via $via" -f "$d/key" </dev/null
+echo "$me"
+cat "$d/key.pub"
+ssh-add -L 2>/dev/null </dev/null | grep -E "^(ssh|ecdsa|sk)-" || true
+echo END
+IFS= read -r cert
+echo "$cert" > "$d/key-cert.pub"
+ssh-add -q -t "${hours}H" "$d/key" </dev/null
+while IFS= read -r old; do
+  [ "$old" = END ] && break
+  echo "$old" > "$d/old.pub"
+  ssh-add -q -d "$d/old.pub" </dev/null >/dev/null 2>&1 || true
+done
+for stem in "session-$role" session; do
+  for ext in .pub -cert.pub; do
+    cp "$d/key$ext" "$HOME/.ssh/$stem$ext.tmp"
+    chmod 644 "$HOME/.ssh/$stem$ext.tmp"
+    mv "$HOME/.ssh/$stem$ext.tmp" "$HOME/.ssh/$stem$ext"
+  done
+done
+echo LOADED
+"""
 
 
 def ca_handles(ssh_dir: Path = Path.home() / ".ssh") -> dict[str, Path]:
@@ -224,6 +272,80 @@ def mint_remote(host: str, remote_user: str, key: str, role: str, *, hours: int,
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def target_takes_agent(host: str, remote_user: str) -> bool:
+    """Whether HOST's account opted in to pushed sessions (AGENT_MARKER)."""
+    out = _run(["ssh", *NO_FORWARDING, f"{remote_user}@{host}",
+                f"test -f {AGENT_MARKER} && echo agent || echo file"]).stdout.decode().split()
+    return bool(out) and out[-1] == "agent"
+
+
+def mint_remote_agent(host: str, remote_user: str, role: str, *, hours: int, strict: bool, ca: Path, user: str, state_dir: Path) -> Certificate:
+    """Sign a key pair HOST makes for this push and load both halves into HOST's
+    own agent. A dead agent on HOST is an error before the YubiKey is asked."""
+    principals = principals_for(user, role, strict)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    target = f"{remote_user}@{host}"
+    stamp = _stamp()
+    command = " ".join(["bash -c", shlex.quote(PUSH_SCRIPT), "ssh-session",
+                        shlex.quote(stamp), str(hours), shlex.quote(role), shlex.quote(_me())])
+    tmp = Path(tempfile.mkdtemp(prefix="remote.", dir=state_dir))
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(["ssh", *NO_FORWARDING, target, command],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err)
+        assert proc.stdin is not None and proc.stdout is not None
+
+        def failure(what: str) -> SessionError:
+            proc.wait()
+            err.seek(0)
+            return SessionError(f"{what} on {target}: {err.read().decode(errors='replace').strip() or 'no detail'}")
+
+        try:
+            lines: list[str] = []
+            while True:
+                raw = proc.stdout.readline()
+                if not raw:
+                    raise failure("could not start the push")
+                line = raw.decode().strip()
+                if line == "END":
+                    break
+                lines.append(line)
+            if len(lines) < 2:
+                raise failure("unexpected reply")
+            target_me, pub_line, held = lines[0], lines[1], lines[2:]
+            pub = tmp / "remote.pub"
+            pub.write_text(pub_line + "\n")
+            _run(["ssh-keygen", "-lf", str(pub)])
+            print(f"signing {role} ({principals}) for {target}'s agent, {hours}h, with the admin CA: enter the YubiKey PIN, then touch it", flush=True)
+            cert = sign(ca, pub, f"{target_me} {stamp} {role} via {_me()}", principals, hours)
+            retired = covered_session_pairs(held, principals.split(","), target_me)
+            reply = cert.read_text().strip() + "\n" + "".join(l + "\n" for pair in retired for l in pair) + "END\n"
+            try:
+                proc.stdin.write(reply.encode())
+                proc.stdin.close()
+            except BrokenPipeError:
+                raise failure("the connection ended before the certificate arrived") from None
+            done = proc.stdout.read().decode()
+            if proc.wait() != 0 or "LOADED" not in done.split():
+                raise failure("could not load the session")
+            c = Certificate.parse(keygen_listing(cert))
+            if retired:
+                print(f"retired {len(retired)} earlier session(s) on {host} this one covers", flush=True)
+            print(f"session loaded into {host}'s agent: {principals} until {c.valid_to.isoformat()}", flush=True)
+            return c
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def agent_certificates() -> list[Certificate]:
     """Every certificate the agent holds."""
     out = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True)
@@ -247,12 +369,24 @@ def retire_covered_sessions(principals: Iterable[str], me: str) -> int:
     "session <me> "; each extra pair is two more keys ssh offers before the one
     that works, and hosts disconnect after MaxAuthTries (6 by default). Keys
     that are not sessions (the git key, anything else) are never touched."""
-    want = set(principals)
     out = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True)
     if out.returncode != 0:
         return 0
-    lines = out.stdout.splitlines()
-    removed = 0
+    pairs = covered_session_pairs(out.stdout.splitlines(), principals, me)
+    with tempfile.TemporaryDirectory() as d:
+        for pair in pairs:
+            for i, pub in enumerate(pair):
+                f = Path(d) / f"del{i}.pub"
+                f.write_text(pub + "\n")
+                subprocess.run(["ssh-add", "-q", "-d", str(f)], capture_output=True)
+    return len(pairs)
+
+
+def covered_session_pairs(lines: Sequence[str], principals: Iterable[str], me: str) -> list[list[str]]:
+    """From an agent listing, each earlier session of ME whose principals are
+    covered: its certificate line and, when present, its plain key line."""
+    want = set(principals)
+    pairs: list[list[str]] = []
     with tempfile.TemporaryDirectory() as d:
         for line in lines:
             parts = line.split(None, 2)
@@ -264,12 +398,8 @@ def retire_covered_sessions(principals: Iterable[str], me: str) -> int:
                 continue
             # the plain key: same comment, a plain key type
             plain = next((l for l in lines if l.split(None, 2)[2:] == [parts[2]] and "-cert-v01@" not in l.split()[0]), None)
-            for i, pub in enumerate(x for x in (line, plain) if x):
-                f = Path(d) / f"del{i}.pub"
-                f.write_text(pub + "\n")
-                subprocess.run(["ssh-add", "-q", "-d", str(f)], capture_output=True)
-            removed += 1
-    return removed
+            pairs.append([x for x in (line, plain) if x])
+    return pairs
 
 
 def status_lines(certs: Iterable[Certificate], now: dt.datetime | None = None) -> list[str]:
