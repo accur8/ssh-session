@@ -8,8 +8,26 @@ the git key, loaded into the ssh-agent.
     ssh-session status           what the agent holds, and until when
     ssh-session gitkey load      the git key alone into the agent (no YubiKey)
     ssh-session gitkey enroll    make this machine's git key, once
-    ssh-session --host H         a certificate for another machine's own key (YubiKey)
+    ssh-session --host H         a session for another machine: into its agent if it opted in, else a certificate file (YubiKey)
     ssh-session tools            the managed checkouts: clone, fast-forward, install
+
+## Pushing a session to your other machine
+
+With the YubiKey on one laptop, `ssh-session --host other --role prod` gives
+the other laptop a session. A machine opts in once, on that machine:
+
+    mkdir -p ~/.config/ssh-session && touch ~/.config/ssh-session/agent-target
+
+On a machine with that file and a live agent on `~/.ssh/agent.sock`, the machine
+makes a fresh key pair, the YubiKey signs the public half, and the key and
+certificate go into that machine's agent until the certificate expires. No
+private key crosses the network or stays on disk. Keep the file to personal
+machines: an agent on a shared host is usable by anyone with root there.
+
+A machine without the file gets the certificate as a file beside its own key,
+which suits a server because the file survives a reboot. A marked machine whose
+agent is down is an error before the YubiKey is asked for anything, and never
+falls back to a key file. `--key` always means the certificate-file path.
 
 ## Getting started
 
