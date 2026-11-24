@@ -9,6 +9,8 @@ the git key, loaded into the ssh-agent.
     ssh-session gitkey load      the git key alone into the agent (no YubiKey)
     ssh-session gitkey enroll    make this machine's git key, once
     ssh-session --host H         a session for another machine: into its agent if it opted in, else a certificate file (YubiKey)
+    ssh-session --host local --host H1 --host H2
+                                 one role for several machines (local = this one): one PIN, a touch each
     ssh-session tools            the managed checkouts: clone, fast-forward, install
 
 ## Pushing a session to your other machine
@@ -28,6 +30,23 @@ A machine without the file gets the certificate as a file beside its own key,
 which suits a server because the file survives a reboot. A marked machine whose
 agent is down is an error before the YubiKey is asked for anything, and never
 falls back to a key file. `--key` always means the certificate-file path.
+
+## Several machines in one run
+
+    ssh-session --role root --hours 18 --host local --host oak --host thalassa
+
+`--host` repeats, and `local` names this machine. Each machine still makes its
+own key pair and gets its own certificate, exactly as a single `--host` does;
+no private key travels. One `ssh-keygen` run signs them all, so the YubiKey
+asks for the PIN once and a touch per machine (measured with the admin CA
+YubiKey and nixpkgs' openssh, 2026-11-24).
+
+Every machine is reached and its key pair made before the YubiKey is asked,
+so an unreachable host or a dead agent stops the run with nothing signed.
+After the signing, a machine that fails to take its certificate does not stop
+the others; the run names it and exits non-zero. Several machines share one
+role and one lifetime (`--hours`, default 2), and the certificates share one
+key id naming every machine.
 
 ## Getting started
 

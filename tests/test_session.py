@@ -282,3 +282,82 @@ def test_a_locked_keychain_says_how_to_unlock(monkeypatch):
     for call in (lambda: gk.KeychainStore().set("a", "b"), lambda: gk.KeychainStore().get("a")):
         with pytest.raises(gk.GitKeyError, match="security unlock-keychain"):
             call()
+
+
+# --- several hosts, one signing ---------------------------------------------
+
+def _count_signings(monkeypatch) -> list[list[str]]:
+    runs: list[list[str]] = []
+    real = s._run
+    def counting(cmd, **kw):
+        if "-s" in cmd:
+            runs.append(list(cmd))
+        return real(cmd, **kw)
+    monkeypatch.setattr(s, "_run", counting)
+    return runs
+
+
+@needs_openssh
+def test_several_hosts_are_signed_in_one_run(push_target, monkeypatch):
+    home, ca, state, _ = push_target
+    (home / ".config/ssh-session").mkdir(parents=True)
+    (home / ".config/ssh-session/agent-target").touch()
+    runs = _count_signings(monkeypatch)
+    failed = s.mint_several([s.LOCAL, "box"], "tester", "root", key=None, hours=1, strict=False, ca=ca,
+                            user="tester", state_dir=state, ssh_dir=tmp_dotssh(home))
+    assert failed == []
+    assert len(runs) == 1 and sum(a.endswith(".pub") for a in runs[0]) == 2
+    # the local key pair and the one box made: two sessions, each its own key
+    certs = s.agent_certificates()
+    assert [c.principals for c in certs] == [("tester-root", "tester-prod", "tester-dev")] * 2
+    assert len({l.split()[1] for l in subprocess.run(["ssh-add", "-L"], capture_output=True, text=True).stdout.splitlines()}) == 4
+    assert list(state.glob("several.*")) == [] and list((home / ".ssh").glob(".session-push.*")) == []
+
+
+@needs_openssh
+def test_several_hosts_with_a_key_file_destination(push_target, monkeypatch):
+    home, ca, state, _ = push_target
+    failed = s.mint_several(["box", s.LOCAL], "tester", "dev", key=".ssh/id_test", hours=1, strict=False, ca=ca,
+                            user="tester", state_dir=state, ssh_dir=tmp_dotssh(home))
+    assert failed == []
+    assert (home / ".ssh/id_test-cert.pub").exists()
+    assert [c.principals for c in s.agent_certificates()] == [("tester-dev",)]
+
+
+@needs_openssh
+def test_several_hosts_sign_nothing_when_one_cannot_be_prepared(push_target, monkeypatch):
+    home, ca, state, pid = push_target
+    (home / ".config/ssh-session").mkdir(parents=True)
+    (home / ".config/ssh-session/agent-target").touch()
+    subprocess.run(["kill", pid], check=True)
+    for _ in range(50):
+        if subprocess.run(["ssh-add", "-l"], capture_output=True).returncode == 2:
+            break
+        time.sleep(0.05)
+    monkeypatch.setattr(s, "sign_many", lambda *a, **k: pytest.fail("signed with a host unprepared"))
+    with pytest.raises(s.SessionError, match="no ssh-agent answers"):
+        s.mint_several([s.LOCAL, "box"], "tester", "dev", key=None, hours=1, strict=False, ca=ca,
+                       user="tester", state_dir=state, ssh_dir=tmp_dotssh(home))
+    assert list(state.glob("several.*")) == [] and list((home / ".ssh").glob(".session-push.*")) == []
+
+
+@needs_openssh
+def test_one_failed_delivery_does_not_stop_the_others(push_target, monkeypatch):
+    home, ca, state, _ = push_target
+    def refuse(self, cert):
+        raise s.SessionError("could not write")
+    monkeypatch.setattr(s.RemoteFileDestination, "deliver", refuse)
+    failed = s.mint_several(["box", s.LOCAL], "tester", "dev", key=".ssh/id_test", hours=1, strict=False, ca=ca,
+                            user="tester", state_dir=state, ssh_dir=tmp_dotssh(home))
+    assert failed == ["box"]
+    assert [c.principals for c in s.agent_certificates()] == [("tester-dev",)]
+
+
+def test_a_host_named_twice_is_refused(tmp_path):
+    with pytest.raises(s.SessionError, match="named twice"):
+        s.mint_several(["oak", "oak"], "tester", "dev", key=None, hours=1, strict=False, ca=tmp_path / "ca",
+                       user="tester", state_dir=tmp_path / "st")
+
+
+def tmp_dotssh(home: Path) -> Path:
+    return home / "local-dotssh"

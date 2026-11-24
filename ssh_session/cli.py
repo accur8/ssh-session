@@ -7,6 +7,8 @@
     ssh-session gitkey load      the git key alone into the agent (no YubiKey)
     ssh-session gitkey enroll    make this machine's git key, once
     ssh-session --host H         a session for another machine: into its agent if it opted in, else a certificate file (YubiKey)
+    ssh-session --host local --host H1 --host H2
+                                 one role for several machines (local = this one): one PIN, a touch each
     ssh-session tools            the managed checkouts: clone, fast-forward, install
 
 Who signs is decided by what is present. An enrolled YubiKey plugged in signs a
@@ -86,23 +88,23 @@ def sync_tools(no_tools: bool) -> None:
 @click.option("--role", "roles", multiple=True, type=click.Choice(list(s.ROLES)),
               help="YubiKey: which role certificate to mint: dev (default), prod, root. Repeatable; root is never implied.")
 @click.option("--hours", type=int, default=None,
-              help="Lifetime in hours (default 4 with a YubiKey, 2 for --host, 12 from the account CA).")
+              help="Lifetime in hours (default 4 with a YubiKey, 2 for --host or several hosts, 12 from the account CA).")
 @click.option("--strict", is_flag=True, help="YubiKey: the one role only; by default a certificate also carries the roles below it.")
 @click.option("--ca", type=click.Path(path_type=Path), default=None,
               help="YubiKey: the admin CA handle (default: the one whose YubiKey is plugged in).")
-@click.option("--host", default=None, help="YubiKey: mint for another machine: into its agent if ~/.config/ssh-session/agent-target exists there, else its own key pair gets the certificate as a file.")
+@click.option("--host", "hosts", multiple=True, help="YubiKey: mint for another machine: into its agent if ~/.config/ssh-session/agent-target exists there, else its own key pair gets the certificate as a file. Repeatable, with 'local' for this machine: one ssh-keygen run signs them all (one PIN, a touch each).")
 @click.option("--user", "remote_user", default=os.environ.get("USER", "unknown"), show_default="you", help="Account on --host.")
 @click.option("--key", default=".ssh/id_accur8", show_default=True, help="Key path on --host, relative to the account's home. Given explicitly, always the certificate-file path.")
 @click.option("--no-git", is_flag=True, help="Do not load the git key into the agent alongside the session.")
 @click.option("--no-tools", is_flag=True, help="Do not bring the managed checkouts up to date after loading the git key.")
 @click.pass_context
-def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git, no_tools):
+def main(ctx, roles, hours, strict, ca, hosts, remote_user, key, no_git, no_tools):
     if ctx.invoked_subcommand is not None:
         return
     try:
         ca = yubikey_ca(ca)
         if ca is None:
-            if roles or strict or host:
+            if roles or strict or hosts:
                 serials = s.plugged_serials()
                 why = no_handle(serials) if serials else "no YubiKey is plugged in"
                 raise s.SessionError(f"--role, --strict and --host need the admin CA on a YubiKey: {why}")
@@ -117,11 +119,24 @@ def main(ctx, roles, hours, strict, ca, host, remote_user, key, no_git, no_tools
             return
         roles = list(roles) or ["dev"]
         user = os.environ.get("USER", "unknown")
+        explicit_key = ctx.get_parameter_source("key") != ParameterSource.DEFAULT
+        if len(hosts) > 1:
+            if len(roles) != 1:
+                raise s.SessionError("one --role for several hosts (one ssh-keygen run signs them all)")
+            failed = s.mint_several(hosts, remote_user, roles[0], key=key if explicit_key else None, hours=hours or 2,
+                                    strict=strict, ca=ca, user=user, state_dir=STATE_DIR)
+            if s.LOCAL in hosts:
+                load_git_key(hours or 2, no_git)
+                sync_tools(no_tools)
+            if failed:
+                raise s.SessionError(f"no session on {', '.join(failed)}; the others have theirs")
+            return
+        host = hosts[0] if hosts and hosts[0] != s.LOCAL else None
         if host:
             if len(roles) != 1:
                 raise s.SessionError("one --role per remote machine (its certificate is one file)")
             # an explicit --key asks for that key file, so only the default looks for the marker
-            if ctx.get_parameter_source("key") == ParameterSource.DEFAULT and s.target_takes_agent(host, remote_user):
+            if not explicit_key and s.target_takes_agent(host, remote_user):
                 s.mint_remote_agent(host, remote_user, roles[0], hours=hours or 2, strict=strict, ca=ca, user=user, state_dir=STATE_DIR)
                 return
             s.mint_remote(host, remote_user, key, roles[0], hours=hours or 2, strict=strict, ca=ca, user=user, state_dir=STATE_DIR)
