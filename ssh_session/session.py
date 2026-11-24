@@ -175,14 +175,21 @@ def keygen_listing(cert_path: Path) -> str:
 def sign(ca: Path, pub: Path, key_id: str, principals: str, hours: int) -> Path:
     """Sign PUB with the admin CA (PIN and touch happen here). Returns the
     certificate path ssh-keygen wrote beside PUB."""
+    return sign_many(ca, [pub], key_id, principals, hours)[0]
+
+
+def sign_many(ca: Path, pubs: Sequence[Path], key_id: str, principals: str, hours: int) -> list[Path]:
+    """Sign every one of PUBS in one ssh-keygen run: with the CA on a YubiKey,
+    the PIN is asked once and the key is touched once per certificate. Returns
+    each certificate path, written beside its public key."""
     if not ca.exists():
         raise SessionError(f"no admin CA handle at {ca} (run the YubiKey ceremony, or --ca PATH)")
     _run(
         ["ssh-keygen", "-q", "-s", str(ca), "-I", key_id, "-n", principals,
-         "-V", f"+{hours}h", "-z", str(int(time.time())), str(pub)],
+         "-V", f"+{hours}h", "-z", str(int(time.time())), *map(str, pubs)],
         capture=False,
     )
-    return pub.with_name(pub.name[: -len(".pub")] + "-cert.pub")
+    return [pub.with_name(pub.name[: -len(".pub")] + "-cert.pub") for pub in pubs]
 
 
 def _stamp() -> str:
@@ -215,36 +222,179 @@ def publish_session(role: str, pub: Path, cert: Path, ssh_dir: Path) -> Path:
     return stem
 
 
+class Destination:
+    """One place a session goes, in two steps around the signing: prepare()
+    makes or fetches the key pair whose public half is signed, deliver() puts
+    the certificate where it belongs. Splitting the two is what lets one
+    ssh-keygen run sign for several machines (one PIN, a touch per key)."""
+
+    pub: Path
+    target_me: str
+
+    def prepare(self, tmp: Path, name: str) -> None:
+        raise NotImplementedError
+
+    def deliver(self, cert: Path) -> Certificate:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class LocalDestination(Destination):
+    """A fresh key pair into this machine's agent. The private half lives only
+    in the caller's 0700 temporary directory, removed when the caller is done."""
+
+    def __init__(self, role: str, principals: str, hours: int, stamp: str, ssh_dir: Path):
+        self.role, self.principals, self.hours, self.stamp, self.ssh_dir = role, principals, hours, stamp, ssh_dir
+        self.target_me = _me()
+
+    def prepare(self, tmp: Path, name: str) -> None:
+        self.key = tmp / name
+        _run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"session {_me()} {self.stamp} {self.role}", "-f", str(self.key)])
+        self.pub = self.key.with_suffix(".pub")
+
+    def deliver(self, cert: Path) -> Certificate:
+        gone = retire_covered_sessions(self.principals.split(","), _me())
+        if gone:
+            print(f"retired {gone} earlier session(s) this one covers", flush=True)
+        _run(["ssh-add", "-q", "-t", f"{self.hours}H", str(self.key)], capture=False)
+        # session-<role> for stanzas that need one role (the backdoor630
+        # jump wants root), and plain `session` for the latest mint, which
+        # the fleet stanza names: one file, so ssh never offers a duplicate.
+        publish_session(self.role, self.pub, cert, self.ssh_dir)
+        publish_session("", self.pub, cert, self.ssh_dir)
+        c = Certificate.parse(keygen_listing(cert))
+        print(f"session loaded: {self.principals} until {c.valid_to.isoformat()}", flush=True)
+        return c
+
+
+class RemoteFileDestination(Destination):
+    """HOST's own key pair (made there on first use) gets the certificate as a
+    file beside it. The private half never leaves HOST."""
+
+    def __init__(self, host: str, remote_user: str, key: str, principals: str):
+        self.host, self.key, self.principals = host, key, principals
+        self.target = self.target_me = f"{remote_user}@{host}"
+
+    def prepare(self, tmp: Path, name: str) -> None:
+        fetch = (f"test -f '{self.key}' || ssh-keygen -q -t ed25519 -N '' -C '{self.target} accur8 session key' -f '{self.key}'; "
+                 f"cat '{self.key}.pub'")
+        self.pub = tmp / f"{name}.pub"
+        self.pub.write_bytes(_run(["ssh", self.target, fetch]).stdout)
+        _run(["ssh-keygen", "-lf", str(self.pub)])
+
+    def deliver(self, cert: Path) -> Certificate:
+        _run(["ssh", self.target, f"cat > '{self.key}-cert.pub'"], input=cert.read_bytes())
+        c = Certificate.parse(keygen_listing(cert))
+        print(f"installed on {self.host} as {self.key}-cert.pub: {self.principals} until {c.valid_to.isoformat()}", flush=True)
+        return c
+
+
+class RemoteAgentDestination(Destination):
+    """A key pair HOST makes for this push, both halves loaded into HOST's own
+    agent. One ssh connection spans prepare to deliver; a dead agent on HOST is
+    an error in prepare, before the YubiKey is asked."""
+
+    def __init__(self, host: str, remote_user: str, role: str, principals: str, hours: int, stamp: str):
+        self.host, self.principals = host, principals
+        self.target = f"{remote_user}@{host}"
+        self.command = " ".join(["bash -c", shlex.quote(PUSH_SCRIPT), "ssh-session",
+                                 shlex.quote(stamp), str(hours), shlex.quote(role), shlex.quote(_me())])
+        self.proc: subprocess.Popen | None = None
+
+    def _failure(self, what: str) -> SessionError:
+        assert self.proc is not None
+        self.proc.wait()
+        self.err.seek(0)
+        return SessionError(f"{what} on {self.target}: {self.err.read().decode(errors='replace').strip() or 'no detail'}")
+
+    def prepare(self, tmp: Path, name: str) -> None:
+        self.err = tempfile.TemporaryFile()
+        self.proc = subprocess.Popen(["ssh", *NO_FORWARDING, self.target, self.command],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err)
+        assert self.proc.stdout is not None
+        lines: list[str] = []
+        while True:
+            raw = self.proc.stdout.readline()
+            if not raw:
+                raise self._failure("could not start the push")
+            line = raw.decode().strip()
+            if line == "END":
+                break
+            lines.append(line)
+        if len(lines) < 2:
+            raise self._failure("unexpected reply")
+        self.target_me, pub_line, self.held = lines[0], lines[1], lines[2:]
+        self.pub = tmp / f"{name}.pub"
+        self.pub.write_text(pub_line + "\n")
+        _run(["ssh-keygen", "-lf", str(self.pub)])
+
+    def deliver(self, cert: Path) -> Certificate:
+        assert self.proc is not None and self.proc.stdin is not None and self.proc.stdout is not None
+        retired = covered_session_pairs(self.held, self.principals.split(","), self.target_me)
+        reply = cert.read_text().strip() + "\n" + "".join(l + "\n" for pair in retired for l in pair) + "END\n"
+        try:
+            self.proc.stdin.write(reply.encode())
+            self.proc.stdin.close()
+        except BrokenPipeError:
+            raise self._failure("the connection ended before the certificate arrived") from None
+        done = self.proc.stdout.read().decode()
+        if self.proc.wait() != 0 or "LOADED" not in done.split():
+            raise self._failure("could not load the session")
+        c = Certificate.parse(keygen_listing(cert))
+        if retired:
+            print(f"retired {len(retired)} earlier session(s) on {self.host} this one covers", flush=True)
+        print(f"session loaded into {self.host}'s agent: {self.principals} until {c.valid_to.isoformat()}", flush=True)
+        return c
+
+    def close(self) -> None:
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                assert proc.stdin is not None
+                proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc is not None:
+            self.err.close()
+
+
+def _private_tmp(state_dir: Path, prefix: str) -> Path:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.chmod(0o700)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=state_dir))
+
+
+def _mint_one(dest: Destination, *, ca: Path, key_id: str, principals: str, hours: int, prompt: str,
+              state_dir: Path, prefix: str) -> Certificate:
+    tmp = _private_tmp(state_dir, prefix)
+    try:
+        dest.prepare(tmp, "key")
+        print(f"signing {prompt}: enter the YubiKey PIN, then touch it", flush=True)
+        return dest.deliver(sign(ca, dest.pub, key_id, principals, hours))
+    finally:
+        dest.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def mint_local(roles: Iterable[str], *, hours: int, strict: bool, ca: Path, user: str, state_dir: Path,
                ssh_dir: Path = Path.home() / ".ssh") -> list[Certificate]:
     """One certificate per role into the agent. The key file lives only inside
     this call, in a 0700 directory, and is removed before returning."""
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_dir.chmod(0o700)
     minted: list[Certificate] = []
-    tmp = Path(tempfile.mkdtemp(prefix="mint.", dir=state_dir))
-    try:
-        for role in roles:
-            principals = principals_for(user, role, strict)
-            stamp = _stamp()
-            key = tmp / role
-            _run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"session {_me()} {stamp} {role}", "-f", str(key)])
-            print(f"signing {role} ({principals}) for {hours}h with the admin CA: enter the YubiKey PIN, then touch it", flush=True)
-            cert = sign(ca, key.with_suffix(".pub"), f"{_me()} {stamp} {role}", principals, hours)
-            gone = retire_covered_sessions(principals.split(","), _me())
-            if gone:
-                print(f"retired {gone} earlier session(s) this one covers", flush=True)
-            _run(["ssh-add", "-q", "-t", f"{hours}H", str(key)], capture=False)
-            # session-<role> for stanzas that need one role (the backdoor630
-            # jump wants root), and plain `session` for the latest mint, which
-            # the fleet stanza names: one file, so ssh never offers a duplicate.
-            publish_session(role, key.with_suffix(".pub"), cert, ssh_dir)
-            publish_session("", key.with_suffix(".pub"), cert, ssh_dir)
-            c = Certificate.parse(keygen_listing(cert))
-            print(f"session loaded: {principals} until {c.valid_to.isoformat()}", flush=True)
-            minted.append(c)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    for role in roles:
+        principals = principals_for(user, role, strict)
+        stamp = _stamp()
+        minted.append(_mint_one(LocalDestination(role, principals, hours, stamp, ssh_dir), ca=ca,
+                                key_id=f"{_me()} {stamp} {role}", principals=principals, hours=hours,
+                                prompt=f"{role} ({principals}) for {hours}h with the admin CA",
+                                state_dir=state_dir, prefix="mint."))
     return minted
 
 
@@ -252,24 +402,11 @@ def mint_remote(host: str, remote_user: str, key: str, role: str, *, hours: int,
     """Sign HOST's own key pair (made there on first use) and install the
     certificate beside it. The private half never leaves HOST."""
     principals = principals_for(user, role, strict)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(prefix="remote.", dir=state_dir))
-    try:
-        target = f"{remote_user}@{host}"
-        fetch = (f"test -f '{key}' || ssh-keygen -q -t ed25519 -N '' -C '{target} accur8 session key' -f '{key}'; "
-                 f"cat '{key}.pub'")
-        pub = tmp / "remote.pub"
-        pub.write_bytes(_run(["ssh", target, fetch]).stdout)
-        _run(["ssh-keygen", "-lf", str(pub)])
-        stamp = _stamp()
-        print(f"signing {role} ({principals}) for {target}, {hours}h, with the admin CA: enter the YubiKey PIN, then touch it", flush=True)
-        cert = sign(ca, pub, f"{target} {stamp} {role} via {_me()}", principals, hours)
-        _run(["ssh", target, f"cat > '{key}-cert.pub'"], input=cert.read_bytes())
-        c = Certificate.parse(keygen_listing(cert))
-        print(f"installed on {host} as {key}-cert.pub: {principals} until {c.valid_to.isoformat()}", flush=True)
-        return c
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    target = f"{remote_user}@{host}"
+    return _mint_one(RemoteFileDestination(host, remote_user, key, principals), ca=ca,
+                     key_id=f"{target} {_stamp()} {role} via {_me()}", principals=principals, hours=hours,
+                     prompt=f"{role} ({principals}) for {target}, {hours}h, with the admin CA",
+                     state_dir=state_dir, prefix="remote.")
 
 
 def target_takes_agent(host: str, remote_user: str) -> bool:
@@ -283,67 +420,66 @@ def mint_remote_agent(host: str, remote_user: str, role: str, *, hours: int, str
     """Sign a key pair HOST makes for this push and load both halves into HOST's
     own agent. A dead agent on HOST is an error before the YubiKey is asked."""
     principals = principals_for(user, role, strict)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    target = f"{remote_user}@{host}"
     stamp = _stamp()
-    command = " ".join(["bash -c", shlex.quote(PUSH_SCRIPT), "ssh-session",
-                        shlex.quote(stamp), str(hours), shlex.quote(role), shlex.quote(_me())])
-    tmp = Path(tempfile.mkdtemp(prefix="remote.", dir=state_dir))
-    with tempfile.TemporaryFile() as err:
-        proc = subprocess.Popen(["ssh", *NO_FORWARDING, target, command],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err)
-        assert proc.stdin is not None and proc.stdout is not None
+    dest = RemoteAgentDestination(host, remote_user, role, principals, hours, stamp)
+    tmp = _private_tmp(state_dir, "remote.")
+    try:
+        dest.prepare(tmp, "key")
+        print(f"signing {role} ({principals}) for {dest.target}'s agent, {hours}h, with the admin CA: enter the YubiKey PIN, then touch it", flush=True)
+        return dest.deliver(sign(ca, dest.pub, f"{dest.target_me} {stamp} {role} via {_me()}", principals, hours))
+    finally:
+        dest.close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
-        def failure(what: str) -> SessionError:
-            proc.wait()
-            err.seek(0)
-            return SessionError(f"{what} on {target}: {err.read().decode(errors='replace').strip() or 'no detail'}")
 
-        try:
-            lines: list[str] = []
-            while True:
-                raw = proc.stdout.readline()
-                if not raw:
-                    raise failure("could not start the push")
-                line = raw.decode().strip()
-                if line == "END":
-                    break
-                lines.append(line)
-            if len(lines) < 2:
-                raise failure("unexpected reply")
-            target_me, pub_line, held = lines[0], lines[1], lines[2:]
-            pub = tmp / "remote.pub"
-            pub.write_text(pub_line + "\n")
-            _run(["ssh-keygen", "-lf", str(pub)])
-            print(f"signing {role} ({principals}) for {target}'s agent, {hours}h, with the admin CA: enter the YubiKey PIN, then touch it", flush=True)
-            cert = sign(ca, pub, f"{target_me} {stamp} {role} via {_me()}", principals, hours)
-            retired = covered_session_pairs(held, principals.split(","), target_me)
-            reply = cert.read_text().strip() + "\n" + "".join(l + "\n" for pair in retired for l in pair) + "END\n"
+LOCAL = "local"
+"""The --host name for this machine, so one run can mint here and elsewhere."""
+
+
+def mint_several(hosts: Sequence[str], remote_user: str, role: str, *, key: str | None, hours: int, strict: bool,
+                 ca: Path, user: str, state_dir: Path, ssh_dir: Path = Path.home() / ".ssh") -> list[str]:
+    """One role for several machines, signed in ONE ssh-keygen run: the YubiKey
+    asks for the PIN once and a touch per certificate. Each machine makes its
+    own key pair, as a single --host does; no private half travels. Every
+    destination is prepared before the YubiKey is asked, so an unreachable
+    host or a dead agent fails the run with nothing signed. After the signing,
+    one failed delivery does not stop the others; the failures are returned.
+
+    HOSTS may include LOCAL (this machine's agent). A remote host takes its
+    agent when it opted in with the marker and KEY is None, else the
+    certificate file beside KEY (default .ssh/id_accur8)."""
+    if len(set(hosts)) != len(hosts):
+        raise SessionError(f"a host is named twice: {' '.join(hosts)}")
+    principals = principals_for(user, role, strict)
+    stamp = _stamp()
+    dests: list[Destination] = []
+    tmp = _private_tmp(state_dir, "several.")
+    try:
+        for i, host in enumerate(hosts):
+            if host == LOCAL:
+                dest: Destination = LocalDestination(role, principals, hours, stamp, ssh_dir)
+            elif key is None and target_takes_agent(host, remote_user):
+                dest = RemoteAgentDestination(host, remote_user, role, principals, hours, stamp)
+            else:
+                dest = RemoteFileDestination(host, remote_user, key or ".ssh/id_accur8", principals)
+            dests.append(dest)
+            dest.prepare(tmp, f"key{i}")
+        names = " ".join(d.target_me for d in dests)
+        print(f"signing {role} ({principals}) for {names}, {hours}h, with the admin CA: "
+              f"enter the YubiKey PIN once, then touch it {len(dests)} times", flush=True)
+        certs = sign_many(ca, [d.pub for d in dests], f"{_me()} {stamp} {role} for {names}", principals, hours)
+        failed: list[str] = []
+        for host, dest, cert in zip(hosts, dests, certs):
             try:
-                proc.stdin.write(reply.encode())
-                proc.stdin.close()
-            except BrokenPipeError:
-                raise failure("the connection ended before the certificate arrived") from None
-            done = proc.stdout.read().decode()
-            if proc.wait() != 0 or "LOADED" not in done.split():
-                raise failure("could not load the session")
-            c = Certificate.parse(keygen_listing(cert))
-            if retired:
-                print(f"retired {len(retired)} earlier session(s) on {host} this one covers", flush=True)
-            print(f"session loaded into {host}'s agent: {principals} until {c.valid_to.isoformat()}", flush=True)
-            return c
-        finally:
-            if proc.poll() is None:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-            shutil.rmtree(tmp, ignore_errors=True)
+                dest.deliver(cert)
+            except SessionError as e:
+                print(f"ssh-session: {host}: {e}", flush=True)
+                failed.append(host)
+        return failed
+    finally:
+        for d in dests:
+            d.close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def agent_certificates() -> list[Certificate]:

@@ -202,3 +202,34 @@ def test_gitkey_load_without_a_key_says_so(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.gk, "DEFAULT_KEY", tmp_path / "no-git-key")
     r = CliRunner().invoke(cli.main, ["gitkey", "load"])
     assert r.exit_code == 1 and "ssh-session gitkey enroll" in r.output
+
+
+def test_several_hosts_go_to_one_signing_with_one_role(monkeypatch, tmp_path):
+    plugged(monkeypatch, {"111": tmp_path / "ca111"}, ["111"])
+    calls = []
+    monkeypatch.setattr(s, "mint_several", lambda hosts, remote_user, role, **kw: calls.append((hosts, role, kw)) or [])
+    monkeypatch.setattr(cli.gk, "DEFAULT_KEY", tmp_path / "no-git-key")
+    r = CliRunner().invoke(cli.main, ["--role", "root", "--hours", "18", "--host", "local", "--host", "oak", "--host", "thalassa"])
+    assert r.exit_code == 0, r.output
+    (hosts, role, kw), = calls
+    assert hosts == ("local", "oak", "thalassa") and role == "root"
+    assert kw["hours"] == 18 and kw["key"] is None and kw["ca"] == tmp_path / "ca111"
+    r = CliRunner().invoke(cli.main, ["--role", "root", "--role", "dev", "--host", "oak", "--host", "thalassa"])
+    assert r.exit_code == 1 and "one --role for several hosts" in r.output
+
+
+def test_a_failed_host_among_several_fails_the_run(monkeypatch, tmp_path):
+    plugged(monkeypatch, {"111": tmp_path / "ca111"}, ["111"])
+    monkeypatch.setattr(s, "mint_several", lambda *a, **kw: ["oak"])
+    r = CliRunner().invoke(cli.main, ["--role", "root", "--host", "oak", "--host", "thalassa"])
+    assert r.exit_code == 1 and "no session on oak" in r.output
+
+
+def test_host_local_alone_is_the_plain_local_session(monkeypatch, tmp_path):
+    plugged(monkeypatch, {"111": tmp_path / "ca111"}, ["111"])
+    calls = []
+    monkeypatch.setattr(s, "mint_local", lambda roles, **kw: calls.append((roles, kw["hours"])) or [])
+    monkeypatch.setattr(cli.gk, "DEFAULT_KEY", tmp_path / "no-git-key")
+    r = CliRunner().invoke(cli.main, ["--role", "root", "--host", "local"])
+    assert r.exit_code == 0, r.output
+    assert calls == [(["root"], 4)]
