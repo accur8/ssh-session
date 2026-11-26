@@ -43,6 +43,11 @@ YubiKey and nixpkgs' openssh, 2026-11-24).
 
 Every machine is reached and its key pair made before the YubiKey is asked,
 so an unreachable host or a dead agent stops the run with nothing signed.
+Reaching a machine is a login to it, made without a password prompt. When a
+machine refuses the login (the morning case: no session in the agent yet) and
+`local` is named, this machine's session is signed first and the others are
+reached with it in a second signing, so the PIN is asked twice. Without
+`local`, the refusal stops the run with nothing signed.
 After the signing, a machine that fails to take its certificate does not stop
 the others; the run names it and exits non-zero. Several machines share one
 role and one lifetime (`--hours`, default 2), and the certificates share one

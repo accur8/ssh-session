@@ -361,3 +361,54 @@ def test_a_host_named_twice_is_refused(tmp_path):
 
 def tmp_dotssh(home: Path) -> Path:
     return home / "local-dotssh"
+
+
+def _ssh_refuses_without_a_session(tmp_path, always: bool = False) -> None:
+    """Replace the fixture's ssh with one that refuses the login (exit 255, as
+    ssh does) while the agent holds no session certificate, or always."""
+    gate = "false" if always else "ssh-add -L 2>/dev/null | grep -q -- -cert-v01@openssh.com"
+    fake = tmp_path / "bin" / "ssh"
+    fake.write_text(
+        '#!/bin/sh\n'
+        f'{gate} || {{ echo "tester@box: Permission denied (publickey)." >&2; exit 255; }}\n'
+        'while [ $# -gt 0 ]; do case "$1" in -T) shift;; -o) shift 2;; *) break;; esac; done\n'
+        'shift\n'
+        'cd "$HOME"\n'
+        'exec bash -c "$*"\n')
+    fake.chmod(0o755)
+
+
+@needs_openssh
+def test_several_hosts_without_a_login_sign_this_machine_first(push_target, monkeypatch):
+    home, ca, state, _ = push_target
+    (home / ".config/ssh-session").mkdir(parents=True)
+    (home / ".config/ssh-session/agent-target").touch()
+    _ssh_refuses_without_a_session(state.parent)
+    runs = _count_signings(monkeypatch)
+    failed = s.mint_several([s.LOCAL, "box"], "tester", "root", key=None, hours=1, strict=False, ca=ca,
+                            user="tester", state_dir=state, ssh_dir=tmp_dotssh(home))
+    assert failed == []
+    # this machine alone, then box reached with that session
+    assert [sum(a.endswith(".pub") for a in r) for r in runs] == [1, 1]
+    assert [c.principals for c in s.agent_certificates()] == [("tester-root", "tester-prod", "tester-dev")] * 2
+
+
+@needs_openssh
+def test_several_hosts_without_a_login_or_local_sign_nothing(push_target, monkeypatch):
+    home, ca, state, _ = push_target
+    _ssh_refuses_without_a_session(state.parent)
+    monkeypatch.setattr(s, "sign_many", lambda *a, **k: pytest.fail("signed with no login to box"))
+    with pytest.raises(s.SessionError, match="cannot log in to box: .*Permission denied"):
+        s.mint_several(["box", "oak"], "tester", "dev", key=None, hours=1, strict=False, ca=ca,
+                       user="tester", state_dir=state, ssh_dir=tmp_dotssh(home))
+
+
+@needs_openssh
+def test_a_host_that_refuses_the_new_session_too_is_reported(push_target, monkeypatch):
+    home, ca, state, _ = push_target
+    _ssh_refuses_without_a_session(state.parent, always=True)
+    failed = s.mint_several([s.LOCAL, "box"], "tester", "dev", key=None, hours=1, strict=False, ca=ca,
+                            user="tester", state_dir=state, ssh_dir=tmp_dotssh(home))
+    assert failed == ["box"]
+    assert [c.principals for c in s.agent_certificates()] == [("tester-dev",)]
+    assert list(state.glob("several.*")) == []

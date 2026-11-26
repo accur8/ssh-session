@@ -41,7 +41,10 @@ AGENT_MARKER = ".config/ssh-session/agent-target"
 # A forwarded agent on the target would receive the session meant for the
 # target's own agent, so a push never forwards anything.
 NO_FORWARDING = ("-T", "-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes",
-                 "-o", "ConnectTimeout=10")
+                 "-o", "ConnectTimeout=10", "-o", "BatchMode=yes")
+# Every login ssh-session makes is non-interactive: a host it cannot log in to
+# with what the agent holds is an error, never a password prompt.
+BATCH = ("-o", "BatchMode=yes")
 # Runs on the target under bash, passed through the login shell (often fish) in
 # single quotes, so this text holds no single quote and no backslash. One ssh
 # connection spans the signing: when the connection ends for any reason, the
@@ -281,11 +284,11 @@ class RemoteFileDestination(Destination):
         fetch = (f"test -f '{self.key}' || ssh-keygen -q -t ed25519 -N '' -C '{self.target} accur8 session key' -f '{self.key}'; "
                  f"cat '{self.key}.pub'")
         self.pub = tmp / f"{name}.pub"
-        self.pub.write_bytes(_run(["ssh", self.target, fetch]).stdout)
+        self.pub.write_bytes(_run(["ssh", *BATCH, self.target, fetch]).stdout)
         _run(["ssh-keygen", "-lf", str(self.pub)])
 
     def deliver(self, cert: Path) -> Certificate:
-        _run(["ssh", self.target, f"cat > '{self.key}-cert.pub'"], input=cert.read_bytes())
+        _run(["ssh", *BATCH, self.target, f"cat > '{self.key}-cert.pub'"], input=cert.read_bytes())
         c = Certificate.parse(keygen_listing(cert))
         print(f"installed on {self.host} as {self.key}-cert.pub: {self.principals} until {c.valid_to.isoformat()}", flush=True)
         return c
@@ -409,11 +412,26 @@ def mint_remote(host: str, remote_user: str, key: str, role: str, *, hours: int,
                      state_dir=state_dir, prefix="remote.")
 
 
+def probe(host: str, remote_user: str) -> tuple[bool | None, str]:
+    """Log in to HOST without a password prompt and see whether its account
+    opted in to pushed sessions (AGENT_MARKER). Answers (True or False, "")
+    for agent or file, or (None, why) when the login fails: no session that
+    HOST accepts is in the agent yet, or HOST is not reachable."""
+    r = subprocess.run(["ssh", *NO_FORWARDING, f"{remote_user}@{host}",
+                        f"test -f {AGENT_MARKER} && echo agent || echo file"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    out = r.stdout.split()
+    if r.returncode != 0 or not out:
+        return None, r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"ssh exit {r.returncode}"
+    return out[-1] == "agent", ""
+
+
 def target_takes_agent(host: str, remote_user: str) -> bool:
     """Whether HOST's account opted in to pushed sessions (AGENT_MARKER)."""
-    out = _run(["ssh", *NO_FORWARDING, f"{remote_user}@{host}",
-                f"test -f {AGENT_MARKER} && echo agent || echo file"]).stdout.decode().split()
-    return bool(out) and out[-1] == "agent"
+    agent, why = probe(host, remote_user)
+    if agent is None:
+        raise SessionError(f"cannot log in to {remote_user}@{host}: {why}")
+    return agent
 
 
 def mint_remote_agent(host: str, remote_user: str, role: str, *, hours: int, strict: bool, ca: Path, user: str, state_dir: Path) -> Certificate:
@@ -447,10 +465,47 @@ def mint_several(hosts: Sequence[str], remote_user: str, role: str, *, key: str 
 
     HOSTS may include LOCAL (this machine's agent). A remote host takes its
     agent when it opted in with the marker and KEY is None, else the
-    certificate file beside KEY (default .ssh/id_accur8)."""
+    certificate file beside KEY (default .ssh/id_accur8).
+
+    Preparing a remote host is a login to it, so the one run needs a session
+    the remotes already accept. When one refuses the login and LOCAL is named,
+    this machine's session is signed first and the remotes are reached with it
+    in a second run: the PIN twice. Without LOCAL, the refusal is the error."""
     if len(set(hosts)) != len(hosts):
         raise SessionError(f"a host is named twice: {' '.join(hosts)}")
     principals = principals_for(user, role, strict)
+    remotes = [h for h in hosts if h != LOCAL]
+    probed = {h: probe(h, remote_user) for h in remotes}
+    refused = [h for h in remotes if probed[h][0] is None]
+    if not refused:
+        return _sign_together(hosts, probed, remote_user, role, principals, key=key, hours=hours, ca=ca,
+                              state_dir=state_dir, ssh_dir=ssh_dir)
+    why = "; ".join(f"{h}: {probed[h][1]}" for h in refused)
+    if LOCAL not in hosts:
+        raise SessionError(f"cannot log in to {why} (nothing signed; add --host local to sign this machine's session first)")
+    print(f"no login yet to {', '.join(refused)}: signing this machine's session first, "
+          f"then the others with it (the PIN twice)", flush=True)
+    failed = _sign_together([LOCAL], {}, remote_user, role, principals, key=key, hours=hours, ca=ca,
+                            state_dir=state_dir, ssh_dir=ssh_dir)
+    if failed:
+        return failed + remotes
+    for h in refused:
+        probed[h] = probe(h, remote_user)
+    still = [h for h in remotes if probed[h][0] is None]
+    for h in still:
+        print(f"ssh-session: {h}: cannot log in with the new session either: {probed[h][1]}", flush=True)
+    ready = [h for h in remotes if h not in still]
+    if ready:
+        failed += _sign_together(ready, probed, remote_user, role, principals, key=key, hours=hours, ca=ca,
+                                 state_dir=state_dir, ssh_dir=ssh_dir)
+    return still + failed
+
+
+def _sign_together(hosts: Sequence[str], probed: dict[str, tuple[bool | None, str]], remote_user: str, role: str,
+                   principals: str, *, key: str | None, hours: int, ca: Path, state_dir: Path,
+                   ssh_dir: Path) -> list[str]:
+    """Prepare every one of HOSTS, sign them in one ssh-keygen run, deliver
+    each. PROBED holds each remote host's probe(); every remote is in it."""
     stamp = _stamp()
     dests: list[Destination] = []
     tmp = _private_tmp(state_dir, "several.")
@@ -458,15 +513,16 @@ def mint_several(hosts: Sequence[str], remote_user: str, role: str, *, key: str 
         for i, host in enumerate(hosts):
             if host == LOCAL:
                 dest: Destination = LocalDestination(role, principals, hours, stamp, ssh_dir)
-            elif key is None and target_takes_agent(host, remote_user):
+            elif key is None and probed[host][0]:
                 dest = RemoteAgentDestination(host, remote_user, role, principals, hours, stamp)
             else:
                 dest = RemoteFileDestination(host, remote_user, key or ".ssh/id_accur8", principals)
             dests.append(dest)
             dest.prepare(tmp, f"key{i}")
         names = " ".join(d.target_me for d in dests)
+        touches = "touch it once" if len(dests) == 1 else f"touch it {len(dests)} times"
         print(f"signing {role} ({principals}) for {names}, {hours}h, with the admin CA: "
-              f"enter the YubiKey PIN once, then touch it {len(dests)} times", flush=True)
+              f"enter the YubiKey PIN once, then {touches}", flush=True)
         certs = sign_many(ca, [d.pub for d in dests], f"{_me()} {stamp} {role} for {names}", principals, hours)
         failed: list[str] = []
         for host, dest, cert in zip(hosts, dests, certs):
